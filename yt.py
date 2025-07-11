@@ -69,23 +69,22 @@ set_background_with_blur(image_file=uploaded_file, image_url=bg_url, blur_px=blu
 
 # Downloader function
 def download_video(url, download_type):
+    ydl_opts = {
+        'format': 'bestaudio/best' if download_type == 'MP3' else 'bestvideo+bestaudio/best',
+        'ffmpeg_location': '/usr/bin/ffmpeg',
+        'outtmpl': '%(title)s.%(ext)s',
+        'quiet': True,
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+        }
+    }
+
     if download_type == 'MP3':
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'outtmpl': '%(title)s.%(ext)s',
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '192',
-            }],
-            'quiet': True
-        }
-    else:
-        ydl_opts = {
-            'format': 'bestvideo+bestaudio/best',
-            'outtmpl': '%(title)s.%(ext)s',
-            'quiet': True
-        }
+        ydl_opts['postprocessors'] = [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '192',
+        }]
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
