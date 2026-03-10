@@ -1,7 +1,12 @@
 import streamlit as st
 import yt_dlp
 import base64
-from scrapling import Scraper
+
+# Safe Scrapling import (prevents cloud crash)
+try:
+    from scrapling.fetchers import Fetcher
+except:
+    Fetcher = None
 
 
 # -------------------------------
@@ -11,10 +16,15 @@ def set_background(blur_level=5, dark_theme=False):
 
     text_color = "#ffffff" if dark_theme else "#000000"
 
-    blur_css = f'''
+    try:
+        bg = get_base64_image("background.jpg")
+    except:
+        bg = ""
+
+    blur_css = f"""
     <style>
     .stApp {{
-        background-image: url("data:image/jpg;base64,{get_base64_image('background.jpg')}");
+        background-image: url("data:image/jpg;base64,{bg}");
         background-size: cover;
         background-attachment: fixed;
         backdrop-filter: blur({blur_level}px);
@@ -22,7 +32,7 @@ def set_background(blur_level=5, dark_theme=False):
         color: {text_color};
     }}
     </style>
-    '''
+    """
 
     st.markdown(blur_css, unsafe_allow_html=True)
 
@@ -37,48 +47,67 @@ def get_base64_image(image_path):
 # -------------------------------
 def extract_video_sources(url):
 
-    scraper = Scraper()
-    page = scraper.get(url)
+    if Fetcher is None:
+        return []
 
-    video_links = set()
+    try:
+        fetcher = Fetcher()
+        page = fetcher.get(url)
 
-    for v in page.css("video"):
-        if v.attr("src"):
-            video_links.add(v.attr("src"))
+        video_links = set()
 
-    for s in page.css("source"):
-        if s.attr("src"):
-            video_links.add(s.attr("src"))
+        for v in page.css("video"):
+            if v.attr("src"):
+                video_links.add(v.attr("src"))
 
-    for iframe in page.css("iframe"):
-        if iframe.attr("src"):
-            video_links.add(iframe.attr("src"))
+        for s in page.css("source"):
+            if s.attr("src"):
+                video_links.add(s.attr("src"))
 
-    for link in page.css("a"):
-        href = link.attr("href")
-        if href and any(ext in href for ext in [".mp4", ".m3u8", ".webm"]):
-            video_links.add(href)
+        for iframe in page.css("iframe"):
+            if iframe.attr("src"):
+                video_links.add(iframe.attr("src"))
 
-    return list(video_links)
+        for link in page.css("a"):
+            href = link.attr("href")
+            if href and any(ext in href for ext in [".mp4", ".m3u8", ".webm"]):
+                video_links.add(href)
+
+        return list(video_links)
+
+    except:
+        return []
 
 
 # -------------------------------
-# yt-dlp Downloader
+# yt-dlp extractor
 # -------------------------------
-def download_video(url):
+def extract_with_ytdlp(url):
 
     ydl_opts = {
-        "format": "best",
-        "quiet": True
+        "quiet": True,
+        "skip_download": True
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-            return info.get("title", "Video Found")
+
+        formats = info.get("formats", [])
+
+        videos = []
+
+        for f in formats:
+            if f.get("url"):
+                videos.append({
+                    "quality": f.get("format_note", "unknown"),
+                    "url": f.get("url")
+                })
+
+        return videos, info.get("title", "Video")
 
     except Exception as e:
-        return f"Error: {e}"
+        return [], str(e)
 
 
 # -------------------------------
@@ -90,7 +119,7 @@ st.set_page_config(page_title="Universal Video Extractor", layout="centered")
 st.title("🎥 Universal Video Extractor")
 st.markdown("Extract videos from almost any website.")
 
-# Sidebar
+# Sidebar settings
 st.sidebar.title("⚙️ Settings")
 
 theme_mode = st.sidebar.radio("Theme", ["Light", "Dark"])
@@ -104,27 +133,37 @@ video_url = st.text_input("🔗 Enter Page URL")
 if st.button("🔍 Extract Videos"):
 
     if not video_url:
-        st.warning("Enter a URL first")
+        st.warning("Please enter a URL")
+        st.stop()
 
-    else:
+    with st.spinner("Scanning page..."):
 
-        with st.spinner("Scanning page..."):
+        # First try Scrapling
+        videos = extract_video_sources(video_url)
 
-            videos = extract_video_sources(video_url)
+        if videos:
+
+            st.success(f"Found {len(videos)} direct video sources")
+
+            for v in videos:
+                st.video(v)
+                st.markdown(f"[⬇ Download Video]({v})")
+
+        else:
+
+            st.warning("No direct video found. Trying yt-dlp...")
+
+            videos, title = extract_with_ytdlp(video_url)
 
             if videos:
 
-                st.success(f"Found {len(videos)} video sources")
+                st.success(f"Video detected: {title}")
 
-                for v in videos:
-                    st.write(v)
+                for v in videos[:10]:
 
-                    st.markdown(f"[Download Video]({v})")
+                    st.write(f"Quality: {v['quality']}")
+                    st.markdown(f"[⬇ Download]({v['url']})")
 
             else:
 
-                st.warning("No direct video found. Trying yt-dlp...")
-
-                title = download_video(video_url)
-
-                st.success(f"Video detected: {title}")
+                st.error("No video streams detected.")
