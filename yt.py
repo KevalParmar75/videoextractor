@@ -133,7 +133,8 @@ if st.button("🔍 Extract Videos"):
                 st.warning("No direct video found. Trying yt-dlp...")
 
                 result = download_video(video_url)
-                st.success(result)        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                st.success(result)        
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             return f"✅ Downloaded: {info.get('title')}"
     except Exception as e:
