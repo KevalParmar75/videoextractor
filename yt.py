@@ -6,6 +6,7 @@ import urllib.request
 import urllib.parse
 import json
 import html
+import time
 from urllib.parse import urljoin, urlparse
 
 # Safe Scrapling import
@@ -15,6 +16,13 @@ try:
 except Exception:
     Fetcher = StealthyFetcher = PlayWrightFetcher = None
     SCRAPLING_AVAILABLE = False
+
+# Safe Playwright import
+try:
+    from playwright.sync_api import sync_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except Exception:
+    PLAYWRIGHT_AVAILABLE = False
 
 
 # ─────────────────────────────────────────────
@@ -394,6 +402,154 @@ def extract_scrapling(url: str) -> list[dict]:
         return []
 
 
+# ─────────────────────────────────────────────
+# Playwright: JS render + network intercept
+# ─────────────────────────────────────────────
+
+VIDEO_MIME_PATTERNS = re.compile(
+    r"(video/|audio/|application/x-mpegurl|application/vnd\.apple\.mpegurl"
+    r"|application/dash\+xml|application/octet-stream)",
+    re.I,
+)
+VIDEO_URL_PATTERNS = re.compile(
+    r"\.(mp4|webm|m3u8|mpd|ts|ogg|ogv|mov|avi|mkv|flv|m4v|3gp)(\?|$|#)",
+    re.I,
+)
+MEDIA_API_PATTERNS = re.compile(
+    r"/(video|stream|media|hls|dash|manifest|playlist|cdn)[_/.-]",
+    re.I,
+)
+
+
+def extract_with_playwright(url: str) -> list[dict]:
+    """
+    Launch a real headless Chromium, intercept ALL network requests,
+    and collect any that look like video streams.
+    Also scrapes the fully-rendered DOM for extra URLs.
+    """
+    if not PLAYWRIGHT_AVAILABLE:
+        return []
+
+    found: list[dict] = []
+    seen: set[str] = set()
+
+    def record(u: str, label: str = "network"):
+        u = u.split("#")[0]  # strip fragments
+        if u in seen or len(u) < 10:
+            return
+        seen.add(u)
+        found.append({"url": u, "type": label, "quality": "auto"})
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-web-security",
+                    "--autoplay-policy=no-user-gesture-required",
+                ],
+            )
+            ctx = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1280, "height": 800},
+                java_script_enabled=True,
+                ignore_https_errors=True,
+            )
+
+            page = ctx.new_page()
+
+            # ── Intercept requests ──────────────────
+            def on_request(req):
+                u = req.url
+                if VIDEO_URL_PATTERNS.search(u) or MEDIA_API_PATTERNS.search(u):
+                    record(u, "network-req")
+
+            def on_response(resp):
+                u = resp.url
+                ct = resp.headers.get("content-type", "")
+                if VIDEO_MIME_PATTERNS.search(ct):
+                    record(u, "network-resp")
+                elif VIDEO_URL_PATTERNS.search(u):
+                    record(u, "network-resp")
+
+            page.on("request", on_request)
+            page.on("response", on_response)
+
+            # ── Navigate ────────────────────────────
+            try:
+                page.goto(url, wait_until="networkidle", timeout=25_000)
+            except Exception:
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=20_000)
+                except Exception:
+                    pass
+
+            # Wait a beat for lazy-loaded players
+            time.sleep(3)
+
+            # ── Click play buttons if present ───────
+            for selector in [
+                "button[class*='play']", "div[class*='play']",
+                "[aria-label*='play' i]", "[aria-label*='Play' i]",
+                ".vjs-play-control", ".ytp-play-button",
+                "button[data-testid*='play']",
+            ]:
+                try:
+                    el = page.query_selector(selector)
+                    if el:
+                        el.click(timeout=2000)
+                        time.sleep(1.5)
+                        break
+                except Exception:
+                    pass
+
+            # ── Scrape rendered DOM ──────────────────
+            try:
+                dom = page.content()
+                for item in extract_from_html_text(dom, url):
+                    record(item["url"], "dom-scrape")
+            except Exception:
+                pass
+
+            # ── Extract from <video> elements ────────
+            try:
+                video_srcs = page.evaluate("""
+                    () => {
+                        const srcs = [];
+                        document.querySelectorAll('video, source').forEach(el => {
+                            if (el.src) srcs.push(el.src);
+                            if (el.currentSrc) srcs.push(el.currentSrc);
+                        });
+                        // also check video.js / hls.js globals
+                        if (window.Hls && window.Hls.DefaultConfig) {
+                            try {
+                                const players = document.querySelectorAll('video');
+                                players.forEach(v => { if (v.src) srcs.push(v.src); });
+                            } catch(e) {}
+                        }
+                        return [...new Set(srcs.filter(Boolean))];
+                    }
+                """)
+                for u in video_srcs or []:
+                    record(u, "js-video-el")
+            except Exception:
+                pass
+
+            browser.close()
+
+    except Exception:
+        pass
+
+    return found
+
+
 def extract_with_ytdlp(url: str) -> tuple[list[dict], str, str | None]:
     """Returns (formats, title, thumbnail)."""
     ydl_opts = {
@@ -507,7 +663,7 @@ if extract_btn:
     with st.spinner("🔍  Probing with yt-dlp…"):
         ytdlp_formats, title_or_err, thumbnail = extract_with_ytdlp(url)
 
-    # ── Phase 2: HTML scrape ───────────────────
+    # ── Phase 2: HTML scrape (static) ──────────
     html_formats: list[dict] = []
     if not ytdlp_formats:
         with st.spinner("🕷  Scraping page source…"):
@@ -517,6 +673,14 @@ if extract_btn:
                 raw = fetch_page_source(url)
                 if raw:
                     html_formats = extract_from_html_text(raw, url)
+
+    # ── Phase 3: Playwright JS render ──────────
+    if not ytdlp_formats and not html_formats:
+        if PLAYWRIGHT_AVAILABLE:
+            with st.spinner("🎭  Rendering JS page with Playwright (this may take ~15s)…"):
+                html_formats = extract_with_playwright(url)
+        else:
+            st.info("💡 Tip: Install `playwright` + `playwright install chromium` for JS-heavy sites like this one.")
 
 
     # ─────────────────────────────────────────────
