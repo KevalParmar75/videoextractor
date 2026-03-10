@@ -550,6 +550,135 @@ def extract_with_playwright(url: str) -> list[dict]:
     return found
 
 
+# ─────────────────────────────────────────────
+# PasteDownload automation (for JS-SPA sites
+# that yt-dlp and static scrapers can't handle)
+# ─────────────────────────────────────────────
+
+def extract_via_pastedownload(video_url: str) -> list[dict]:
+    """
+    Automates PasteDownload.com using Playwright:
+    1. Navigates to their universal downloader
+    2. Pastes the URL and clicks Download
+    3. Waits for results to render
+    4. Harvests all download links from the result page
+    """
+    if not PLAYWRIGHT_AVAILABLE:
+        return []
+
+    found = []
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox"],
+            )
+            ctx = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1280, "height": 800},
+                ignore_https_errors=True,
+            )
+            page = ctx.new_page()
+
+            # Go to universal downloader
+            page.goto(
+                "https://pastedownload.com/universal-video-downloader/",
+                wait_until="networkidle",
+                timeout=30_000,
+            )
+
+            # Find and fill the input
+            input_sel = "input[type='text'], input[type='url'], input[name*='url' i], input[placeholder*='url' i], input[placeholder*='link' i], textarea"
+            page.wait_for_selector(input_sel, timeout=10_000)
+            inp = page.query_selector(input_sel)
+            if not inp:
+                browser.close()
+                return []
+
+            inp.fill(video_url)
+            time.sleep(0.5)
+
+            # Click the submit / download button
+            btn_sel = "button[type='submit'], button[class*='download' i], button[class*='btn' i], input[type='submit']"
+            btn = page.query_selector(btn_sel)
+            if btn:
+                btn.click()
+            else:
+                inp.press("Enter")
+
+            # Wait for results — look for download links appearing
+            try:
+                page.wait_for_selector(
+                    "a[href*='.mp4'], a[href*='.m3u8'], a[href*='download'], a[class*='download' i], .download-link, #download-results a",
+                    timeout=25_000,
+                )
+            except Exception:
+                # Give it extra time even if selector not matched
+                time.sleep(8)
+
+            # Grab ALL links from the page
+            links = page.evaluate("""
+                () => {
+                    const anchors = Array.from(document.querySelectorAll('a[href]'));
+                    return anchors.map(a => ({
+                        href: a.href,
+                        text: (a.innerText || a.textContent || '').trim().slice(0, 80),
+                        classes: a.className
+                    }));
+                }
+            """)
+
+            VIDEO_EXTS = ('.mp4', '.webm', '.m3u8', '.mpd', '.ogg', '.mov', '.mkv', '.flv', '.avi', '.m4v', '.mp3', '.m4a')
+            DL_KEYWORDS = ('download', 'dl', 'save', 'get', 'video', 'media', 'file', 'stream', 'cdn', 'storage')
+
+            seen = set()
+            for link in (links or []):
+                href = link.get('href', '')
+                text = link.get('text', '').lower()
+                classes = link.get('classes', '').lower()
+
+                if not href or href in seen:
+                    continue
+                if href.startswith(('javascript:', 'mailto:', '#')):
+                    continue
+                # Skip same-site navigation links
+                if 'pastedownload.com' in href and not any(k in href for k in ('cdn', 'storage', 'media', 'file', 'dl', 'download')):
+                    continue
+
+                is_video_ext   = any(ext in href.lower() for ext in VIDEO_EXTS)
+                is_dl_class    = any(k in classes for k in ('download', 'dl-link', 'btn-dl'))
+                is_dl_keyword  = any(k in text for k in ('download', 'save', 'hd', '720', '1080', '480', 'mp4', 'webm'))
+                is_cdn_link    = any(k in href.lower() for k in DL_KEYWORDS) and href.startswith('http')
+
+                if is_video_ext or is_dl_class or is_dl_keyword or is_cdn_link:
+                    seen.add(href)
+                    quality = "unknown"
+                    for q in ['2160p', '1080p', '720p', '480p', '360p', '240p', 'HD', 'SD']:
+                        if q.lower() in text or q.lower() in href.lower():
+                            quality = q
+                            break
+                    found.append({
+                        "url": href,
+                        "quality": quality,
+                        "type": "pastedownload",
+                        "ext": "",
+                        "filesize": None,
+                        "label": link.get('text', '') or "Download",
+                    })
+
+            browser.close()
+
+    except Exception:
+        pass
+
+    return found
+
+
 def extract_with_ytdlp(url: str) -> tuple[list[dict], str, str | None]:
     """Returns (formats, title, thumbnail)."""
     ydl_opts = {
@@ -674,13 +803,20 @@ if extract_btn:
                 if raw:
                     html_formats = extract_from_html_text(raw, url)
 
-    # ── Phase 3: Playwright JS render ──────────
+    # ── Phase 3: Playwright direct JS render ───
     if not ytdlp_formats and not html_formats:
         if PLAYWRIGHT_AVAILABLE:
-            with st.spinner("🎭  Rendering JS page with Playwright (this may take ~15s)…"):
+            with st.spinner("🎭  Rendering JS page with Playwright…"):
                 html_formats = extract_with_playwright(url)
+
+    # ── Phase 4: PasteDownload fallback ────────
+    pd_formats: list[dict] = []
+    if not ytdlp_formats and not html_formats:
+        if PLAYWRIGHT_AVAILABLE:
+            with st.spinner("🌐  Trying PasteDownload.com as fallback (may take ~20s)…"):
+                pd_formats = extract_via_pastedownload(url)
         else:
-            st.info("💡 Tip: Install `playwright` + `playwright install chromium` for JS-heavy sites like this one.")
+            st.info("💡 Tip: Install `playwright` + run `playwright install chromium` to enable JS rendering and PasteDownload fallback for sites like this.")
 
 
     # ─────────────────────────────────────────────
@@ -767,6 +903,37 @@ if extract_btn:
         if playable:
             with st.expander("▶  Preview first video"):
                 st.video(playable["url"])
+
+    elif pd_formats:
+
+        st.markdown(f"""
+        <div class="result-header">
+          <span class="badge" style="background:rgba(251,146,60,0.2);border-color:rgba(251,146,60,0.4);color:#fb923c;">PasteDownload</span>
+          <h3>{len(pd_formats)} link{"s" if len(pd_formats)!=1 else ""} found</h3>
+        </div>
+        <p style="font-family:'DM Mono',monospace;font-size:.78rem;color:#6b6880;margin-bottom:1rem;">
+          ⚠️ These links are served by PasteDownload.com and may expire. Download promptly.
+        </p>
+        """, unsafe_allow_html=True)
+
+        for f in pd_formats:
+            label = f.get("label") or "Download"
+            quality = f.get("quality", "")
+            st.markdown(f"""
+            <div class="video-card">
+              <div class="meta">
+                {'<span class="tag tag-quality">' + html.escape(quality) + '</span>' if quality and quality != "unknown" else ''}
+                <span class="tag tag-source">via PasteDownload</span>
+              </div>
+              <div style="font-family:'DM Mono',monospace;font-size:.76rem;color:#6b6880;
+                          margin-bottom:.6rem;word-break:break-all;">
+                {html.escape(f['url'][:100])}{"…" if len(f['url'])>100 else ""}
+              </div>
+              <a class="dl-link" href="{html.escape(f['url'])}" target="_blank" rel="noopener">
+                ↓ &nbsp;{html.escape(label[:40])}
+              </a>
+            </div>
+            """, unsafe_allow_html=True)
 
     else:
         st.error(
